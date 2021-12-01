@@ -130,6 +130,9 @@ rpc_wallet_file =
 ## SERVER 1/4) Darkscience IRC (Tor, IP)
 ################################################################################
 [MESSAGING:server1]
+# by default the legacy format without a `type` field is
+# understood to be IRC, but you can, optionally, add it:
+# type = irc
 channel = joinmarket-pit
 port = 6697
 usessl = true
@@ -158,58 +161,6 @@ directory-nodes = 0344bc51c0b0cf58ebfee222bdd8ff4855ac3becd7a9c8bff8ff0810077117
 passthrough-port = 49100
 # this is the port serving lightning on your onion service:
 lightning-port = 9735
-
-[MESSAGING:server2]
-# by default the legacy format without a `type` field is
-# understood to be IRC, but you can, optionally, add it:
-# type = irc
-channel = joinmarket-pit
-
-# for traditional IP (default):
-host = irc.hackint.org
-port = 6697
-usessl = true
-socks5 = false
-
-# for Tor (recommended as clearnet alternative):
-#host = ncwkrwxpq2ikcngxq3dy2xctuheniggtqeibvgofixpzvrwpa77tozqd.onion
-#port = 6667
-#usessl = false
-#socks5 = true
-#socks5_host = localhost
-#socks5_port = 9050
-
-## SERVER 3/4) Anarplex IRC (Tor, IP)
-################################################################################
-[MESSAGING:server3]
-channel = joinmarket-pit
-
-# for traditional IP (default):
-host = agora.anarplex.net
-port = 14716
-usessl = true
-socks5 = false
-
-# for Tor (recommended as clearnet alternative):
-#host = vxecvd6lc4giwtasjhgbrr3eop6pzq6i5rveracktioneunalgqlwfad.onion
-#port = 6667
-#usessl = false
-#socks5 = true
-#socks5_host = localhost
-#socks5_port = 9050
-
-## SERVER 4/4) ILITA IRC (Tor — disabled by default)
-################################################################################
-#[MESSAGING:server4]
-#channel = joinmarket-pit
-#port = 6667
-#usessl = false
-#socks5 = true
-#socks5_host = localhost
-
-# for Tor (recommended):
-#host = ilitafrzzgxymv6umx2ux7kbz3imyeko6cnqkvy4nisjjj4qpqkrptid.onion
-#socks5_port = 9050
 
 [LOGGING]
 # Set the log level for the output to the terminal/console
