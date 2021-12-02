@@ -5,6 +5,7 @@ import os
 from twisted.internet import reactor
 from twisted.internet.protocol import ReconnectingClientFactory
 from twisted.protocols.basic import LineReceiver
+from jmbase import bintohex
 
 """ jmcl - joinmarket over clightning.
     This is deliberately a very "dumb" plugin.
@@ -59,9 +60,10 @@ def send_tcp_message(msg: bytes) -> None:
         tcppp.starting_msg = msg
     
 def send_local_control_message(msgtype: int, text: str) -> None:
-    # Notice that this does *not* have the same format as those
-    # that come from the onionmessage calls:
-    msg = {"unknown_fields": [{"number": msgtype, "value": text}]}
+    # We use the same msgtype/msg format as custommsg for now:
+    hextype = "%0.4x" % msgtype
+    hextext = bintohex(text.encode("utf-8"))
+    msg = {"peer_id": "00", "payload": hextype + hextext}
     send_tcp_message(json.dumps(msg).encode("utf-8"))
 
 plugin = Plugin(autopatch=False)
@@ -89,9 +91,10 @@ def on_disconnect(plugin, id, **kwargs):
     plugin.log("Received disconnect event for peer {}".format(id))
     send_local_control_message(787, id)
 
-@plugin.hook("onion_message")
-def on_onion_message(plugin, onion_message, **kwargs):
-    send_tcp_message(json.dumps(onion_message).encode("utf-8"))
+@plugin.hook("custommsg")
+def on_custommsg(peer_id, payload, plugin, **kwargs):
+    send_tcp_message(json.dumps({"peer_id": peer_id,
+                                 "payload": payload}).encode("utf-8"))
     return {"result": "continue"}
 
 def run():

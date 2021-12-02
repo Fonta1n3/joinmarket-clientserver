@@ -165,6 +165,7 @@ class TCPPassThroughFactory(ServerFactory):
     def buildProtocol(self, addr):
         self.p = TCPPassThroughProtocol(self)
         return self.p
+
     def add_tcp_listener(self, listener):
         self.listeners.append(listener)
 
@@ -206,6 +207,10 @@ class LNOnionPeerDirectoryWithoutHostError(LNOnionPeerError):
 
 class LNOnionPeerConnectionError(LNOnionPeerError):
     pass
+
+class LNCustomMsgFormatError(Exception):
+    pass
+
 
 class LNOnionPeer(object):
 
@@ -270,7 +275,9 @@ class LNOnionPeer(object):
             raise LNOnionPeerConnectionError(
                 "Cannot connect without host, port info")
         try:
+            print("about to call the rpc connect method with location: {}".format(self.peer_location()))
             rpcclient.call("connect", [self.peer_location()])
+            print("finished the rpc connect call")
         except RpcError as e:
             raise LNOnionPeerConnectionError(
                 "Connection to: {}failed with error: {}".format(
@@ -298,6 +305,38 @@ class LNOnionPeer(object):
         rpcclient.call("disconnect", [self.peer_location()])
         self.is_connected = False
 
+class LNCustomMessage(object):
+    """ Encapsulates the messages passed over the wire
+    to and from c-lightning using the `sendcustommsg` rpc.
+    """
+    def __init__(self, text: str, msgtype: int):
+        self.text = text
+        self.msgtype = msgtype
+
+    def encode(self) -> str:
+        bintext = self.text.encode("utf-8")
+        hextext = bintohex(bintext)
+        hextype = "%0.4x" % self.msgtype
+        self.encoded = hextype + hextext
+        return self.encoded
+
+    @classmethod
+    def from_sendcustommsg_decode(cls, msg:
+                                     str):
+        """ This is not the reverse operation to encode,
+        since we receive, via the plugin hook to the
+        receive custom msg event.
+        """
+        try:
+            type_hex = msg[:4]
+            message_hex = msg[4:]
+        except:
+            raise LNCustomMsgFormatError
+        msgtype = int(type_hex, 16)
+        text = hextobin(message_hex).decode("utf-8")
+        return cls(text, msgtype)
+
+# NOT CURRENTLY IN USE:
 class LNOnionMessage(object):
     """ Encapsulates the messages passed over the wire
     from c-lightning, allow conversion into the text
@@ -409,12 +448,12 @@ class LNOnionMessageChannel(MessageChannel):
         """
         peerids = self.get_directory_peers()
         for peerid in peerids:
-            self._send(peerid, LNOnionMessage(self.get_pubmsg(msg),
+            self._send(peerid, LNCustomMessage(self.get_pubmsg(msg),
                                 JM_MESSAGE_TYPES["pubmsg"]).encode())
 
     def _privmsg(self, nick, cmd, msg):
         log.debug("Privmsging to: {}, {}, {}".format(nick, cmd, msg))
-        encoded_privmsg = LNOnionMessage(self.get_privmsg(nick, cmd, msg),
+        encoded_privmsg = LNCustomMessage(self.get_privmsg(nick, cmd, msg),
                             JM_MESSAGE_TYPES["privmsg"]).encode()
         peerid = self.get_peerid_by_nick(nick)
         if peerid:
@@ -517,12 +556,13 @@ class LNOnionMessageChannel(MessageChannel):
     def _send(self, peerid: str, message: bytes) -> bool:
         """
         This method is "raw" in that it only respects
-        c-lightning's sendonionmessage syntax; it does
+        c-lightning's sendcustommsg syntax; it does
         not manage the syntax of the underlying Joinmarket
         message in any way.
         Sends a message to a peer on the message channel,
-        identified by `peerid`, in TLV hex format.
-        To encode the `message` field use `LNOnionMessage.encode`.
+        identified by `peerid`, in hex format, with two byte
+        type prepended.
+        To encode the `message` field use `LNCustomMessage.encode`.
         Arguments:
         peerid: hex-encoded string.
         message: raw bytes, encoded as per above.
@@ -530,15 +570,10 @@ class LNOnionMessageChannel(MessageChannel):
         False if RpcError is raised by a failed RPC call,
         or True otherwise.
         """
-        payload={
-            "hops": [{"id": peerid,
-                      "rawtlv": message}]
-        }
         # TODO handle return:
         try:
-            # TODO: as of 0.10.2 this format is obsolete ("obs"),
-            # so we will need to change it soon:
-            self.rpc_client.call("sendobsonionmessage", payload)
+            log.debug("Sending message: {} to peer: {}".format(message, peerid[:8]))
+            self.rpc_client.sendcustommsg(peerid, message)
         except RpcError as e:
             # This can happen when a peer disconnects, depending
             # on the timing:
@@ -554,27 +589,31 @@ class LNOnionMessageChannel(MessageChannel):
     def receive_msg(self, data):
         """ The entry point for all data coming over LN into our process.
         This includes control messages from the plugin that inform
-        us about updates to peers. Notice that since the lightningd daemon
-        doesn't know about our message types, it just lumps them all into
-        "unknown_fields".
+        us about updates to peers. Our local messages will come in with
+        peer_id 00, and our message types are always two bytes long, these
+        two aspects are to conform with the current `sendcustommsg` RPC format.
         """
         try:
-            msgtypeval = data["unknown_fields"][0]
-            msgtype = msgtypeval["number"]
-            msgval = msgtypeval["value"]
+            # A curiosity: currently we don't even pay attention to what
+            # peer_id sent this message, and that's not necessarily wrong!
+            # peer = data["peer_id"]
+            msgobj = LNCustomMessage.from_sendcustommsg_decode(data["payload"])
+            log.debug("Receiving type: {}, message: {}".format(msgobj.msgtype, msgobj.text))
+        except LNCustomMsgFormatError:
+            log.warn("Incorrect custom message format: {}".format(data["payload"]))
+            return
         except Exception as e:
             log.warn("Ill formed message received: {}, exception: {}".format(
                 data, e))
             return
+        msgtype = msgobj.msgtype
+        msgval = msgobj.text
         if msgtype in LOCAL_CONTROL_MESSAGE_TYPES.values():
             self.process_control_message(msgtype, msgval)
             # local control messages are processed first, as their "value"
             # field is not in the onion-TLV format.
             return
-        # this converts the hex-encoded message from c-lightning
-        # into JM's text string:
-        msgval = LNOnionMessage.from_sendonionmessage_decode(msgval,
-                                                    msgtype).text
+
         if self.process_control_message(msgtype, msgval):
             # will return True if it is, elsewise, a control message.
             return
@@ -617,7 +656,7 @@ class LNOnionMessageChannel(MessageChannel):
         # TODO: specifically with forwarding/broadcasting,
         # we introduce the danger of infinite re-broadcast,
         # if there is more than one party forwarding.
-        encoded_msg = LNOnionMessage(pubmsg, msgtype).encode()
+        encoded_msg = LNCustomMessage(pubmsg, msgtype).encode()
         for peer in self.get_connected_nondirectory_peers():
             # don't loop back to the sender:
             if peer.nick == from_nick:
@@ -638,7 +677,7 @@ class LNOnionMessageChannel(MessageChannel):
         msg = " ".join(cmdmsglist[1:])
         privmsg = self.get_privmsg(nick, cmd, msg, source_nick=from_nick)
         log.debug("Sending out privmsg: {} to peer: {}".format(privmsg, peerid))
-        encoded_msg = LNOnionMessage(privmsg,
+        encoded_msg = LNCustomMessage(privmsg,
                         JM_MESSAGE_TYPES["privmsg"]).encode()
         self._send(peerid, encoded_msg)
 
@@ -801,7 +840,7 @@ class LNOnionMessageChannel(MessageChannel):
             # for *ourselves* to add to peer lists of other
             # nodes.
             msg = self.self_as_peer.get_nick_peerlocation_ser()
-            success = self._send(dp.peerid, LNOnionMessage(msg,
+            success = self._send(dp.peerid, LNCustomMessage(msg,
                     CONTROL_MESSAGE_TYPES["getpeerlist"]).encode())
             if not success:
                 # a failure of the RPC call is interpreted as a failure
@@ -847,7 +886,7 @@ class LNOnionMessageChannel(MessageChannel):
             peerlist.add(p.get_nick_peerlocation_ser())
         # For testing: dns won't usually participate:
         peerlist.add(self.self_as_peer.get_nick_peerlocation_ser())
-        self._send(requesting_peer.peerid, LNOnionMessage(",".join(
+        self._send(requesting_peer.peerid, LNCustomMessage(",".join(
             peerlist), CONTROL_MESSAGE_TYPES["peerlist"]).encode())
 
 
