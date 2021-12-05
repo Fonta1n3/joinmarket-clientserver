@@ -1,41 +1,60 @@
 from jmdaemon.message_channel import MessageChannel
-from jmdaemon.protocol import COMMAND_PREFIX
-from jmbase import get_log, bintohex, hextobin, stop_reactor
+from jmdaemon.protocol import COMMAND_PREFIX, JM_VERSION
+from jmbase import get_log, bintohex, hextobin, stop_reactor, JM_APP_NAME
 from pyln.client import LightningRpc, RpcError
 from io import BytesIO
 import struct
 import json
+from typing import Callable
 from twisted.internet import reactor, task
 from twisted.internet.protocol import ServerFactory
 from twisted.protocols.basic import LineReceiver
 log = get_log()
 
 LOCAL_CONTROL_MESSAGE_TYPES = {"connect": 785, "disconnect": 787}
-CONTROL_MESSAGE_TYPES = {"peerlist": 789, "getpeerlist": 791}
+CONTROL_MESSAGE_TYPES = {"peerlist": 789, "getpeerlist": 791,
+                         "handshake": 793, "dn-handshake": 795}
 JM_MESSAGE_TYPES = {"privmsg": 685, "pubmsg": 687}
 
 # Used for some control message construction, as detailed below.
 NICK_PEERLOCATOR_SEPARATOR = ";"
+
+client_handshake_json = {"app-name": JM_APP_NAME,
+ "directory": False,
+ "proto-ver": JM_VERSION,
+ "features": {}
+}
+
+# default acceptance false; code must switch it on:
+server_handshake_json = {"app-name": JM_APP_NAME,
+  "directory": True,
+  "proto-ver-min": JM_VERSION,
+  "proto-ver-max": JM_VERSION,
+  "features": {},
+  "accepted": False
+ }
+
+# states that keep track of relationship to a peer
+PEER_STATUS_UNCONNECTED, PEER_STATUS_CONNECTED, PEER_STATUS_HANDSHAKED, \
+    PEER_STATUS_DISCONNECTED = range(4)
 
 """
 ### MESSAGE FORMAT USED on the LN-ONION CHANNELS
 
 ( || means concatenation for strings, here)
 
-`rawtlv` as defined in https://lightning.readthedocs.io/lightning-sendonionmessage.7.html
-is hex-encoded and therefore is of form:
+Messages conveyed between directly connected nodes with `sendcustommsg`
+have the format described here:
 
-hex-encoded-varint-message-type || hex-encoded-length-of-message || hex-encoded-message
+https://lightning.readthedocs.io/PLUGINS.html#custommsg
 
-This encoding must happen here (though, as explained below, the receiving side is different).
+Note in particular, that `type` is a two byte hex-encoded string
+that prepends the actual message (also hex-encoded), without any intervening
+length field. This `type` is the integer specified in this file as *_MESSAGE_TYPES.
 
-The rest of this description is how the third field, `message`, is created, and read:
+Note also that the type *must* be odd for custom messages (the "it's OK to be odd" principle).
 
-Since we cannot assume a 1:1 mapping of `nick` to lightning daemon (and therefore peerid),
-we prepend with both the Joinmarket nicks (this is slightly awkward but keeps compatibility
-with existing IRC message channels).
-
-In text, the message is therefore:
+In text, the messages we send via this mechanism are of this format:
 
 from-nick || COMMAND_PREFIX || to-nick || COMMAND_PREFIX || cmd || " " || innermessage
 
@@ -51,6 +70,68 @@ Note also that there is no chunking requirement applied here, based on the assum
 That'll probably be changed later.
 
 ### CONTROL MESSAGES
+
+#### HANDSHAKE CONTROL MESSAGES
+
+The message `handshake` is sent by any peer/node not configured to act as
+directory node, to any other node it connects to, as the first message.
+The message `dn-handshake` is sent by any peer/node which is configured to
+act as a directory node, to any other node, as a response to the initial
+`handshake` message.
+(Notice that this configuration implies that directory nodes do not currently
+talk to each other).
+
+The syntax of `handshake` is:
+json serialized:
+  {"app-name": "joinmarket",
+   "directory": false,
+   "proto-ver": 5,
+   "features": {}
+  }
+Note that `proto-ver` is the version specified as `JM_VERSION` in jmdaemon.protocol.
+(It has not changed for many years, it only specifies the syntax of the messages).
+The `features` field is currently empty.
+
+The syntax of `dn-handshake` is:
+json serialized:
+ {"app-name": "joinmarket",
+  "directory": true,
+  "proto-ver-min": 5,
+  "proto-ver-max": 5,
+  "features": {}
+  "accepted": true,
+ }
+
+ Non-directory nodes should send `handshake` to directory nodes,
+ and directory nodes should return the `dn-handshake` method with `true`
+ for accepted, if and only if:
+ * the protocol version is in the accepted range
+ * the `directory` field of the peer is false
+ * the `app-name` is joinmarket
+ * the set of features requested is both recognized and accepted (currently: none)
+
+ In case those conditions are met, return `"accepted": true`, else return
+ `"accepted": false` and immediately disconnect the new peer.
+ (in this rejection case, the remaining fields of the `dn-handshake` message do
+ not matter, but can be kept as before for convenience).
+
+In case of a direct connection between peers (neither are directory nodes),
+the party which connects then sends the first `handshake` message, and the
+connected-to party responds with their own `handshake`.
+
+In this case, the connection should be accepted and maintained by the receiver
+if and only if:
+* the protocol version is identical
+* the `directory` field of the peer is false
+* the `app-name` is joinmarket
+* the set of features is both recognized and accepted (currently: none)
+
+otherwise the peer should be immediately disconnected.
+
+ALL OTHER MESSAGES (control or otherwise, as detailed below), cannot be sent/
+will be ignored until the above two-way handshake is complete.
+
+#### OTHER CONTROL MESSAGES
 
 The messages `getpeerlist` and `peerlist` are special messages sent to and
 from directory servers.
@@ -227,7 +308,7 @@ class LNOnionPeer(object):
         if directory and not (self.hostname):
             raise LNOnionPeerDirectoryWithoutHostError()
         self.directory = directory
-        self.is_connected = False
+        self.status = PEER_STATUS_UNCONNECTED
 
     def set_nick(self, nick):
         self.nick = nick
@@ -269,7 +350,7 @@ class LNOnionPeer(object):
         """ This method is called to fire the RPC `connect`
         call to the LN peer associated with this instance.
         """
-        if self.is_connected:
+        if self.status in [PEER_STATUS_HANDSHAKED, PEER_STATUS_CONNECTED]:
             return
         if not (self.hostname and self.port > 0):
             raise LNOnionPeerConnectionError(
@@ -282,11 +363,14 @@ class LNOnionPeer(object):
             raise LNOnionPeerConnectionError(
                 "Connection to: {}failed with error: {}".format(
                     self.peer_location(), repr(e)))
-        self.is_connected = True
+        self.status == PEER_STATUS_CONNECTED
 
-    def try_to_connect(self, rpcclient: LightningRpc) -> None:
+    def try_to_connect(self, rpcclient: LightningRpc,
+                       post_connection_callback: Callable = lambda *args:None) -> None:
         """ This method wraps LNOnionPeer.connect and accepts
         any error if that fails.
+        The second argument is an optional callback, which is to be
+        called on successful connection.
         """
         try:
             self.connect(rpcclient=rpcclient)
@@ -295,15 +379,21 @@ class LNOnionPeer(object):
         except Exception as e:
             log.warn("Got unexpected exception in connect attempt: {}".format(
                 repr(e)))
+        # currently this is specifically used only to carry out the handshake:
+        post_connection_callback(self)
 
     def disconnect(self, rpcclient: LightningRpc) -> None:
-        if not self.is_connected:
+        if self.status in [PEER_STATUS_UNCONNECTED, PEER_STATUS_DISCONNECTED]:
             return
         if not (self.hostname and self.port > 0):
             raise LNOnionPeerConnectionError(
                 "Cannot disconnect without host, port info")
-        rpcclient.call("disconnect", [self.peer_location()])
-        self.is_connected = False
+        try:
+            rpcclient.call("disconnect", [self.peer_location()])
+        except RpcError as e:
+            raise LNOnionPeerConnectionError("Disconnection from {} failed "
+                "with error: {}".format(self.peer_location(), repr(e)))
+        self.status = PEER_STATUS_DISCONNECTED
 
 class LNCustomMessage(object):
     """ Encapsulates the messages passed over the wire
@@ -377,6 +467,7 @@ class LNOnionMessageChannel(MessageChannel):
     to access a list of current active nodes, and updates
     dynamically from messages seen.
     """
+
     def __init__(self,
                  configdata,
                  daemon=None):
@@ -459,7 +550,7 @@ class LNOnionMessageChannel(MessageChannel):
         if peerid:
             peer = self.get_peer_by_id(peerid)
         # notice the order matters here!:
-        if not peerid or not peer or not peer.is_connected:
+        if not peerid or not peer or not peer.status == PEER_STATUS_HANDSHAKED:
             # If we are trying to message a peer via their nick, we
             # may not yet have a connection; then we just
             # forward via directory nodes.
@@ -525,14 +616,22 @@ class LNOnionMessageChannel(MessageChannel):
         """ First job of the bot is to get an
         up to date peer list (assuming it is not the seeding
         node).
+        It does that by: (a) connecting to a directory node
+        (unless it itself is a directory node, in which case it does
+        nothing here), and then (b) handshaking with the dn to
+        ensure compatibility. After these two steps, it can (c)
+        send the `getpeerlist` control message.
         """
         if self.genesis_node:
+            # we are a directory and we have no directory peers;
+            # just start.
             self.on_welcome(self)
             return
+        # the remaining code is only executed by non-directories:
         for p in self.peers:
             log.info("Trying to connect to node: {}".format(p.peerid))
             try:
-                p.connect(self.rpc_client)
+                p.try_to_connect(self.rpc_client, self.handshake_as_client)
             except LNOnionPeerConnectionError:
                 pass
         # after all the connections are in place, we can
@@ -543,6 +642,19 @@ class LNOnionMessageChannel(MessageChannel):
         # (we needed to wait until we had a fresh peer list).
         # This is what triggers the start of taker/maker workflows.
         self.on_welcome(self)
+
+    def handshake_as_client(self, peer: LNOnionPeer) -> None:
+        assert peer.status == PEER_STATUS_CONNECTED
+        # We fire and forget the handshake; successful setting
+        # of the `is_handshaked` var in the Peer object will depend
+        # on a valid/success return via the custommsg hook in the plugin.
+        self._send(peer.peerid, LNCustomMessage(json.dumps(
+            client_handshake_json), 793).encode())
+
+    def handshake_as_directory(self, peer: LNOnionPeer) -> None:
+        assert peer.status == PEER_STATUS_CONNECTED
+        self._send(peer.peerid, LNCustomMessage(json.dumps(
+            server_handshake_json), 795).encode())
 
     def get_directory_peers(self):
         return [ p.peerid for p in self.peers if p.directory is True]
@@ -594,9 +706,7 @@ class LNOnionMessageChannel(MessageChannel):
         two aspects are to conform with the current `sendcustommsg` RPC format.
         """
         try:
-            # A curiosity: currently we don't even pay attention to what
-            # peer_id sent this message, and that's not necessarily wrong!
-            # peer = data["peer_id"]
+            peer = data["peer_id"]
             msgobj = LNCustomMessage.from_sendcustommsg_decode(data["payload"])
             log.debug("Receiving type: {}, message: {}".format(msgobj.msgtype, msgobj.text))
         except LNCustomMsgFormatError:
@@ -609,12 +719,12 @@ class LNOnionMessageChannel(MessageChannel):
         msgtype = msgobj.msgtype
         msgval = msgobj.text
         if msgtype in LOCAL_CONTROL_MESSAGE_TYPES.values():
-            self.process_control_message(msgtype, msgval)
+            self.process_control_message(peer, msgtype, msgval)
             # local control messages are processed first, as their "value"
             # field is not in the onion-TLV format.
             return
 
-        if self.process_control_message(msgtype, msgval):
+        if self.process_control_message(peer, msgtype, msgval):
             # will return True if it is, elsewise, a control message.
             return
 
@@ -681,7 +791,8 @@ class LNOnionMessageChannel(MessageChannel):
                         JM_MESSAGE_TYPES["privmsg"]).encode()
         self._send(peerid, encoded_msg)
 
-    def process_control_message(self, msgtype: int, msgval: str) -> bool:
+    def process_control_message(self, peerid: str, msgtype: int,
+                                msgval: str) -> bool:
         """ Triggered by a directory node feeding us
         peers, or by a connect/disconnect hook
         in the c-lightning plugin; this is our housekeeping
@@ -726,6 +837,11 @@ class LNOnionMessageChannel(MessageChannel):
             # comment much as above; if we can't connect, it's none
             # of our business.
             return True
+        elif msgtype == CONTROL_MESSAGE_TYPES["handshake"]:
+            # sent by non-directory peers on startup
+            self.process_handshake(peerid, msgval)
+        elif msgtype == CONTROL_MESSAGE_TYPES["dn-handshake"]:
+            self.process_handshake(peerid, msgval, dn=True)
         elif msgtype == LOCAL_CONTROL_MESSAGE_TYPES["connect"]:
             self.add_peer(msgval, connection=True,
                           overwrite_connection=True)
@@ -737,6 +853,89 @@ class LNOnionMessageChannel(MessageChannel):
         # If we got here it is *not* a non-local control message;
         # so we must process it as a Joinmarket message.
         return False
+
+
+    def process_handshake(self, peerid: str, message: str,
+                          dn: bool=False) -> None:
+        peer = self.get_peer_by_id(peerid)
+        if not peer:
+            # rando sent us a handshake?
+            log.warn("Unexpected handshake from unknown peer: {}, "
+                     "ignoring.".format(peerid))
+            return
+        if not peer.status == PEER_STATUS_CONNECTED:
+            # we were not waiting for it:
+            log.warn("Unexpected handshake from peer: {}, "
+                     "ignoring. Peer's current status is: {}".format(
+                         peerid, peer.status))
+            return
+        if dn:
+            # it means, we are a non-dn and we are expecting
+            # a returned `dn-handshake` message:
+            # (currently dns don't talk to other dns):
+            assert not self.self_as_peer.directory
+            if not peer.directory:
+                # got dn-handshake from non-dn:
+                log.warn("Unexpected dn-handshake from non-dn "
+                         "node: {}, ignoring.".format(peerid))
+                return
+            # we got the right message from the right peer;
+            # check it is formatted correctly and represents
+            # acceptance of the connection
+            try:
+                handshake_json = json.loads(message)
+                app_name = handshake_json["app-name"]
+                is_directory = handshake_json["directory"]
+                proto_min = handshake_json["proto-ver-min"]
+                proto_max = handshake_json["proto-ver-max"]
+                features = handshake_json["features"]
+                accepted = handshake_json["accepted"]
+                assert isinstance(proto_max), int
+                assert isinstance(proto_min), int
+                assert isinstance(features, dict)
+            except:
+                log.warn("Invalid handshake message from: {}, "
+                         "ignoring".format(peerid))
+                return
+            # currently we are not using any features, but the intention
+            # is forwards compatibility, so we don't check its contents
+            # at all.
+            if not accepted:
+                log.warn("Directory: {} rejected our handshake.".format(peerid))
+                return
+            if not (app_name == JM_APP_NAME and is_directory and JM_VERSION \
+                    <= proto_max and JM_VERSION >= proto_min and accepted):
+                log.warn("Handshake from directory is incompatible or "
+                         "rejected: {}".format(handshake_json))
+                return
+            # We received a valid, accepting dn-handshake. Update the peer.
+            peer.status = PEER_STATUS_HANDSHAKED
+        else:
+            # it means, we are receiving an initial handshake
+            # message from a 'client' (non-dn) peer.
+            # dns don't talk to each other:
+            assert not peer.directory
+            try:
+                handshake_json = json.loads(message)
+                app_name = handshake_json["app-name"]
+                is_directory = handshake_json["directory"]
+                proto_ver = handshake_json["proto-ver"]
+                features = handshake_json["features"]
+                assert isinstance(proto_ver), int
+                assert isinstance(features, dict)
+            except:
+                log.warn("Invalid handshake message from: {}, "
+                         "ignoring".format(peerid))
+                return
+            if not (app_name == JM_APP_NAME and proto_ver == JM_VERSION \
+                    and not is_directory):
+                log.warn("Invalid handshake name/version data: {}, from peer: "
+                         "{}, rejecting.".format(message, peerid))
+                return
+            # client peer's handshake message was valid; send ours, and
+            # then mark this peer as successfully handshaked:
+            self.handshake_as_directory(peer)
+            peer.status = PEER_STATUS_HANDSHAKED
 
     def get_peer_by_id(self, p: str):
         """ Returns the LNOnionPeer with peerid p,
@@ -776,17 +975,19 @@ class LNOnionMessageChannel(MessageChannel):
             if not p:
                 # no address info here
                 p = LNOnionPeer(peer)
-                p.is_connected = connection
+                if connection:
+                    p.status = PEER_STATUS_CONNECTED
                 self.peers.add(p)
             elif overwrite_connection:
-                p.is_connected = connection
+                if connection:
+                    p.status = PEER_STATUS_CONNECTED
+                else:
+                    p.status = PEER_STATUS_DISCONNECTED
             if with_nick:
                 p.set_nick(nick)
             return p
         elif len(peer) > 66:
             # assumed that it's passing a full string
-            # TODO need to think about logic of 'is_connected'
-            # state here.
             try:
                 temp_p = LNOnionPeer.from_location_string(peer)
             except Exception as e:
@@ -805,12 +1006,22 @@ class LNOnionMessageChannel(MessageChannel):
                     # and we are not currently connected. We
                     # try to connect asynchronously. We don't pay attention
                     # to any return; this is opportunistic, only, currently.
-                    reactor.callLater(0.0, temp_p.try_to_connect, self.rpc_client)
+                    # Notice that the final argument is a callback to be called
+                    # if and when connection succeeds; here it's the sending
+                    # of the handshake message, to that peer.
+                    # Notice this is only possible for non-dns to other non-dns,
+                    # since dns will never reach this point without an active
+                    # connection.
+                    reactor.callLater(0.0, temp_p.try_to_connect, self.rpc_client,
+                                      self.handshake_as_client)
                 return temp_p
             else:
                 p = self.get_peer_by_id(temp_p.peerid)
                 if overwrite_connection:
-                    p.is_connected = connection
+                    if connection:
+                        p.status = PEER_STATUS_CONNECTED
+                    else:
+                        p.status = PEER_STATUS_DISCONNECTED
                 if with_nick:
                     p.set_nick(nick)
                 return p
@@ -823,10 +1034,12 @@ class LNOnionMessageChannel(MessageChannel):
                self.get_connected_nondirectory_peers()
 
     def get_connected_directory_peers(self):
-        return [p for p in self.peers if p.directory and p.is_connected]
+        return [p for p in self.peers if p.directory and p.status == \
+                PEER_STATUS_HANDSHAKED]
 
     def get_connected_nondirectory_peers(self):
-        return [p for p in self.peers if (not p.directory) and p.is_connected]
+        return [p for p in self.peers if (not p.directory) and p.status == \
+                PEER_STATUS_HANDSHAKED]
 
     """ CONTROL MESSAGES SENT BY US
     """
