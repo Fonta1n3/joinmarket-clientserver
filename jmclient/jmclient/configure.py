@@ -730,7 +730,10 @@ def start_ln(chaninfo, jm_ln_dir):
                "--experimental-onion-messages"]
     # testing needs static values:
     if brpc_net == "regtest":
-        fixed_key_str = "1212121212121212121212121212121212121212121212121212121212121211"
+        # just to save an extra var in tests, use the last digit of the
+        # passthrough port:
+        last_digit = str(chaninfo["passthrough-port"] % 10)
+        fixed_key_str = "121212121212121212121212121212121212121212121212121212121212121" + last_digit
         command.append("--dev-force-privkey="+fixed_key_str)
     # we need to create c-lightning's own config file, in lightningdir/config.
     # This requires the bitcoin rpc config also:
@@ -743,9 +746,14 @@ def start_ln(chaninfo, jm_ln_dir):
                      "bitcoin-rpcport=" + brpc_port,
                      "bitcoin-rpcuser=" + brpc_user,
                      "bitcoin-rpcpassword=" + brpc_password,
-                     brpc_net,
-                     "experimental-onion-messages",
-                     "proxy=127.0.0.1:9050",
+                     "network=" + brpc_net,
+                     "experimental-onion-messages"]
+    if brpc_net == "regtest":
+        lnconfiglines += ["addr=127.0.0.1:" + str(ln_serving_port),
+                          "log-level=debug",
+                          "log-file=" + jm_ln_dir + "/log"]
+    else:
+        lnconfiglines += ["proxy=127.0.0.1:9050",
                      "bind-addr=127.0.0.1:" + str(ln_serving_port),
                      "addr=autotor:127.0.0.1:9051/torport=" + str(ln_serving_port),
                      "always-use-proxy=true"]
