@@ -1173,7 +1173,6 @@ class LNOnionMessageChannel(MessageChannel):
         # (we needed to wait until we had a fresh peer list).
         # This is what triggers the start of taker/maker workflows.
         if not self.on_welcome_sent:
-            log.warn("ON WELCOME IS NOW TRIGGERED")
             self.on_welcome(self)
             self.on_welcome_sent = True
 

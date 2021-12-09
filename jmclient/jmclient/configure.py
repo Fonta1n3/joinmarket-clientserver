@@ -726,8 +726,7 @@ def start_ln(chaninfo, jm_ln_dir):
     floc = os.path.dirname(os.path.abspath(__file__))
     jmcl_loc = os.path.join(floc, "..", "..", "jmdaemon", "jmdaemon", "jmcl.py")
     command = [os.path.join(lightningd_loc, "lightningd"), "--plugin="+jmcl_loc,
-               "--jmport="+passthrough_port, "--lightning-dir=" + jm_ln_dir,
-               "--experimental-onion-messages"]
+               "--jmport="+passthrough_port, "--lightning-dir=" + jm_ln_dir]
     # testing needs static values:
     if brpc_net == "regtest":
         # just to save an extra var in tests, use the last digit of the
@@ -746,8 +745,7 @@ def start_ln(chaninfo, jm_ln_dir):
                      "bitcoin-rpcport=" + brpc_port,
                      "bitcoin-rpcuser=" + brpc_user,
                      "bitcoin-rpcpassword=" + brpc_password,
-                     "network=" + brpc_net,
-                     "experimental-onion-messages"]
+                     "network=" + brpc_net]
     if brpc_net == "regtest":
         lnconfiglines += ["addr=127.0.0.1:" + str(ln_serving_port),
                           "log-level=debug",
