@@ -154,7 +154,7 @@ def send_tcp_message(msg: bytes) -> None:
         # accounts for the fact that we don't expect the
         # backend server to be up until we're ready to send
         # messages:
-        plugin.log("Attempting connection to backend on port: ".format(plugin.jmport))
+        plugin.log("Attempting connection to backend on port: {}".format(plugin.jmport))
         backend_line_sender.initialize("socket:127.0.0.1:" + str(plugin.jmport))
         backend_line_sender.connect()
     backend_line_sender.sendLine(msg)

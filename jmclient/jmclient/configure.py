@@ -153,13 +153,28 @@ socks5 = false
 # be only ONE such message channel configured (note the directory servers
 # can be multiple, below):
 type = ln-onion
+
+# Setting this to any value apart from the default, 'bundled':
+# This indicates to Joinmarket that the c-lightning executable is
+# already running on your machine and we instead use the contents
+# of this variable as the location of the RPC socket file for lightning.
+# By default it is found in ~/.lightning/[network]/lightning-rpc,
+# where [network] is one of bitcoin, signet, testnet, regtest.
+# Be sure to read the documentation at docs/lightning-message-channels.md
+# to find out how to run the Joinmarket plugin jmcl.py inside your c-lightning instance,
+# and configure the correct "TCP passthrough port" for it (see `passthrough-port` below).
+clightning-location = bundled
+# or (check your user has access rights):
+# clightning-location = /home/username/.lightning/bitcoin/lightning-rpc
+
 # This is a comma separated list (comma can be omitted if only one item).
 # Each item has format pubkey@host:port ; all are required. Host can be
 # a *.onion address (tor v3 only).
 directory-nodes = 0344bc51c0b0cf58ebfee222bdd8ff4855ac3becd7a9c8bff8ff08100771179047@mvm5ffyipzf4tis2g753w7q25evcqmvj6qnnwgr3dkpyukomykzvwuad.onion:9736
-# port via which we receive data from the c-lightning plugin:
+# The port via which we receive data from the c-lightning plugin; if not bundled,
+# make sure it matches what you set in the jmcl.py plugin:
 passthrough-port = 49100
-# this is the port serving lightning on your onion service:
+# this is the port serving lightning on your onion service, bundled or otherwise:
 lightning-port = 9735
 
 [LOGGING]
@@ -694,19 +709,34 @@ def load_program_config(config_path="", bs=None, plugin_services=[],
             if not os.path.exists(plogsdir):
                 os.makedirs(plogsdir)
             p.set_log_dir(plogsdir)
-    # if a ln-onion message channel was configured, we start the
-    # packaged/customised lightning daemon with the required ports
-    # in the background at the startup of each script.
+    # Check if a ln-onion message channel was configured:
     chans = get_mchannels()
     lnchans = [x for x in chans if "type" in x and x["type"] == "ln-onion"]
+    # only 1; multiple directories will be in the config:
     assert len(lnchans) < 2
     if lnchans and ln_backend_needed:
-        jm_ln_dir = os.path.join(global_singleton.datadir, "lightning")
-        if not os.path.exists(jm_ln_dir):
-            os.makedirs(jm_ln_dir)
-        start_ln(lnchans[0], jm_ln_dir)
+        lnchanconfig = lnchans[0]
+        if lnchanconfig["clightning-location"] == "bundled":
+            # The creation of a datadir and the startup of the daemon
+            # are considered not-needed if you are not running the bundled
+            # copy of c-lightning; you should have read the docs and set it up
+            # yourself otherwise (see the config comments).
+            jm_ln_dir = os.path.join(global_singleton.datadir, "lightning")
+            if not os.path.exists(jm_ln_dir):
+                os.makedirs(jm_ln_dir)
+            start_ln(lnchanconfig, jm_ln_dir)
+        else:
+            # we still need to set the location of the RPC to instantiate
+            # our LightningRpc object:
+            global_singleton.config.set(lnchanconfig["section-name"],
+                    "lightning-rpc", lnchanconfig["clightning-location"])
 
 def start_ln(chaninfo, jm_ln_dir):
+    """ If a LN message channel is configured with the
+    # "bundled" setting, we start the packaged/customised
+    # lightning daemon with the required ports
+    # in the background at the startup of each script.
+    """
     # First, we dynamically update this LN message chan
     # config section to include the location on which its
     # RPC socket will exist:
