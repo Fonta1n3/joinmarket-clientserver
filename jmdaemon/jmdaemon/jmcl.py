@@ -7,7 +7,7 @@ import logging
 import json
 import os
 import re
-from jmbase import bintohex
+from binascii import hexlify
 
 """ jmcl - joinmarket over clightning.
     This is deliberately a very "dumb" plugin.
@@ -162,7 +162,7 @@ def send_tcp_message(msg: bytes) -> None:
 def send_local_control_message(msgtype: int, text: str) -> None:
     # We use the same msgtype/msg format as custommsg for now:
     hextype = "%0.4x" % msgtype
-    hextext = bintohex(text.encode("utf-8"))
+    hextext = hexlify(text.encode("utf-8")).decode("utf-8")
     msg = {"peer_id": "00", "payload": hextype + hextext}
     send_tcp_message(json.dumps(msg).encode("utf-8"))
 
@@ -198,25 +198,7 @@ def on_custommsg(peer_id, payload, plugin, **kwargs):
                                  "payload": payload}).encode("utf-8"))
     return {"result": "continue"}
 
-def run():
-    # iterate manually over the stdin iterator
-    # to shut down gracefully at the end.
-    try:
-        l = next(plugin.stdin.buffer)
-    except StopIteration:
-        return
-
-    plugin.buffer += l
-    msgs = plugin.buffer.split(b'\n\n')
-    if len(msgs) < 2:
-        run()
-        return
-    plugin.buffer = plugin._multi_dispatch(msgs)
-    run()
-
-plugin.buffer = b""
-
 if os.environ.get('LIGHTNINGD_PLUGIN', None) != '1':
     plugin.print_usage()
 else:
-    run()
+    plugin.run()
