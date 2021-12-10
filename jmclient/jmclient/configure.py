@@ -485,7 +485,8 @@ def get_mchannels():
               ("socks5", str), ("socks5_host", str), ("socks5_port", str)]
     lightning_fields = [("type", str), ("directory-nodes", str),
                         ("passthrough-port", int), ("lightning-rpc", str),
-                        ("lightning-hostname", str), ("lightning-port", int)]
+                        ("lightning-hostname", str), ("lightning-port", int),
+                        ("clightning-location", str)]
 
     configs = []
     for section in sections:
